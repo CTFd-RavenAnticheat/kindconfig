@@ -98,14 +98,15 @@ traefik:
 	  --timeout=90s
 	@echo "==> Traefik ingress controller ready!"
 
+
 storage:
-	@echo "==> Waiting for default namespace to be active..."
-	@kubectl wait --for=condition=Active namespace/default --timeout=60s
+	@echo "==> Waiting for StorageClass to be available..."
+	@until kubectl get storageclass $(STORAGE_CLASS) >/dev/null 2>&1; do sleep 1; done
 	kubectl apply -f $(PVC_FILE)
 
 app:
-	@echo "==> Waiting for default namespace to be active..."
-	@kubectl wait --for=condition=Active namespace/default --timeout=60s
+	@echo "==> Waiting for PVC to be bound..."
+	@kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/pcap-core --timeout=60s
 	kubectl apply -f $(POD_FILE)
 
 status:
