@@ -13,6 +13,7 @@ NFS_EXPORT_DIR := /srv/nfs/k8s
 NFS_CIDR := 172.17.0.0/16
 NFS_EXPORT_LINE := $(NFS_EXPORT_DIR) $(NFS_CIDR)(rw,sync,no_subtree_check,no_root_squash)
 TRAEFIK_NAMESPACE := networking
+HOST_IP ?= $(shell ip route get 1 | awk '{print $$(NF-2); exit}')
 OS_ID := $(shell . /etc/os-release 2>/dev/null && echo $$ID)
 OS_LIKE := $(shell . /etc/os-release 2>/dev/null && echo $$ID_LIKE)
 # Arch Linux
@@ -36,9 +37,9 @@ endif
 ifndef NFS_PKG
 $(error Unsupported OS ($(OS_ID)). Supported: arch, ubuntu, debian)
 endif
-.PHONY: all nfs status app cluster clean nfs-host storage traefik
+.PHONY: all nfs status app cluster clean nfs-host storage traefik metallb
 
-all: cluster nfs traefik storage app status
+all: cluster nfs metallb traefik storage app status
 
 nfs-host:
 	@echo "==> Host OS detected: $(OS_ID)"
@@ -66,6 +67,9 @@ nfs-host:
 cluster:
 	-kind get clusters | grep -q $(CLUSTER_NAME) || \
 	kind create cluster --name $(CLUSTER_NAME) --config $(KIND_CONFIG)
+	@echo "==> Updating kubeconfig with Docker network IP for container access..."
+	@DOCKER_IP=$$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' kind-control-plane); \
+	kubectl config set-cluster kind-kind --server=https://$$DOCKER_IP:6443
 
 nfs:
 	helm repo add nfs-subdir-external-provisioner \
@@ -77,27 +81,50 @@ nfs:
 	  --set nfs.path=$(NFS_EXPORT_DIR) \
 	  --set storageClass.name=$(STORAGE_CLASS)
 
+metallb:
+	@echo "==> Installing MetalLB..."
+	kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.3/config/manifests/metallb-native.yaml
+	@echo "==> Waiting for MetalLB to be ready..."
+	kubectl wait --namespace metallb-system --for=condition=ready pod --selector=app=metallb --timeout=120s
+	@echo "==> Configuring MetalLB IP pool..."
+	kubectl apply -f - <<-EOF
+	apiVersion: metallb.io/v1beta1
+	kind: IPAddressPool
+	metadata:
+	  name: default
+	  namespace: metallb-system
+	spec:
+	  addresses:
+	  - $(HOST_IP)/32
+	---
+	apiVersion: metallb.io/v1beta1
+	kind: L2Advertisement
+	metadata:
+	  name: default
+	  namespace: metallb-system
+	EOF
+	@echo "==> MetalLB configured with IP: $(HOST_IP)"
+
 traefik:
 	@echo "==> Installing Traefik in namespace: $(TRAEFIK_NAMESPACE)"
 	kubectl create namespace $(TRAEFIK_NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
 	helm repo add traefik https://traefik.github.io/charts || true
 	helm repo update
+	@echo "==> Configuring Traefik with LoadBalancer type (MetalLB)..."
 	helm upgrade --install traefik traefik/traefik \
 	  --namespace $(TRAEFIK_NAMESPACE) \
 	  --set ingressClass.enabled=true \
 	  --set ingressClass.isDefaultClass=true \
-	  --set service.type=NodePort \
-	  --set ports.web.nodePort=30080 \
-	  --set ports.websecure.nodePort=30443 \
+	  --set service.type=LoadBalancer \
 	  --set ports.web.exposedPort=80 \
-	  --set ports.websecure.exposedPort=443
+	  --set ports.websecure.exposedPort=443 \
+	  --set providers.kubernetesIngress.publishedService.enabled=true
 	@echo "==> Waiting for Traefik to be ready..."
 	kubectl wait --namespace $(TRAEFIK_NAMESPACE) \
 	  --for=condition=ready pod \
 	  --selector=app.kubernetes.io/name=traefik \
 	  --timeout=90s
 	@echo "==> Traefik ingress controller ready!"
-
 
 storage:
 	@echo "==> Waiting for StorageClass to be available..."
@@ -127,4 +154,5 @@ clean:
 	-kubectl delete -f $(PVC_FILE) --ignore-not-found
 	-helm uninstall traefik --namespace $(TRAEFIK_NAMESPACE)
 	-helm uninstall nfs-provisioner
+	-kubectl delete -f https://raw.githubusercontent.com/metallb/metallb/v0.14.3/config/manifests/metallb-native.yaml --ignore-not-found
 	kind delete cluster --name $(CLUSTER_NAME)

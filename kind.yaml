@@ -16,3 +16,8 @@ nodes:
   - containerPort: 30443
     hostPort: 443
     protocol: TCP
+  # Map NodePort range for challenges (30000-32767 is k8s NodePort range)
+  # Mapping 31000-31100 to host ports 31000-31100
+  - containerPort: 31298
+    hostPort: 31298
+    protocol: TCP
