@@ -1,0 +1,18 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+networking:
+  apiServerAddress: "0.0.0.0"
+  apiServerPort: 6443
+
+nodes:
+- role: control-plane
+  extraPortMappings:
+  # Map host ports to Traefik's fixed NodePorts
+  # Traefik HTTP (web) NodePort: 30080
+  - containerPort: 30080
+    hostPort: 80
+    protocol: TCP
+  # Traefik HTTPS (websecure) NodePort: 30443
+  - containerPort: 30443
+    hostPort: 443
+    protocol: TCP
