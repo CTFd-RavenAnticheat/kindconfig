@@ -85,25 +85,13 @@ metallb:
 	@echo "==> Installing MetalLB..."
 	kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.3/config/manifests/metallb-native.yaml
 	@echo "==> Waiting for MetalLB to be ready..."
-	kubectl wait --namespace metallb-system --for=condition=ready pod --selector=app=metallb --timeout=120s
-	@echo "==> Configuring MetalLB IP pool..."
-	kubectl apply -f - <<-EOF
-	apiVersion: metallb.io/v1beta1
-	kind: IPAddressPool
-	metadata:
-	  name: default
-	  namespace: metallb-system
-	spec:
-	  addresses:
-	  - $(HOST_IP)/32
-	---
-	apiVersion: metallb.io/v1beta1
-	kind: L2Advertisement
-	metadata:
-	  name: default
-	  namespace: metallb-system
-	EOF
-	@echo "==> MetalLB configured with IP: $(HOST_IP)"
+	@sleep 5
+	kubectl wait --namespace metallb-system --for=condition=ready pod --selector=app=metallb --timeout=120s || \
+		(echo "Pods not ready yet, checking status..." && kubectl get pods -n metallb-system && \
+		 echo "Waiting again..." && kubectl wait --namespace metallb-system --for=condition=ready pod --selector=app=metallb --timeout=120s)
+	@echo "==> Configuring MetalLB IP pool with IP: $(HOST_IP)..."
+	@sed "s/HOST_IP_PLACEHOLDER/$(HOST_IP)/g" metallb-config.yaml | kubectl apply -f -
+	@echo "==> MetalLB configured!"
 
 traefik:
 	@echo "==> Installing Traefik in namespace: $(TRAEFIK_NAMESPACE)"
