@@ -7,11 +7,11 @@ CLUSTER_NAME := kind
 KIND_CONFIG   := kind.yaml
 PVC_FILE := pvc.yaml
 POD_FILE := pod.yaml
-NFS_SERVER := 172.17.0.1
+NFS_SERVER = $(shell docker network inspect kind -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1)
 STORAGE_CLASS := nfs-rwx
 NFS_EXPORT_DIR := /srv/nfs/k8s
-NFS_CIDR := 172.17.0.0/16
-NFS_EXPORT_LINE := $(NFS_EXPORT_DIR) $(NFS_CIDR)(rw,sync,no_subtree_check,no_root_squash)
+NFS_CIDR = $(shell docker network inspect kind -f '{{range .IPAM.Config}}{{.Subnet}}{{end}}' 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}' | head -1)
+NFS_EXPORT_LINE = $(NFS_EXPORT_DIR) $(NFS_CIDR)(rw,sync,no_subtree_check,no_root_squash)
 TRAEFIK_NAMESPACE := networking
 HOST_IP ?= $(shell ip route get 1 | awk '{print $$(NF-2); exit}')
 OS_ID := $(shell . /etc/os-release 2>/dev/null && echo $$ID)
@@ -59,8 +59,9 @@ nfs-host:
 	@sudo systemctl enable --now $(NFS_SERVICE)
 	@sudo mkdir -p $(NFS_EXPORT_DIR)
 	@sudo chmod 777 $(NFS_EXPORT_DIR)
-	@sudo grep -qxF '$(NFS_EXPORT_LINE)' /etc/exports || \
-		echo '$(NFS_EXPORT_LINE)' | sudo tee -a /etc/exports
+	@echo "==> Configuring NFS exports for all Docker networks..."
+	@sudo grep -qxF '$(NFS_EXPORT_DIR) *(rw,sync,no_subtree_check,no_root_squash)' /etc/exports || \
+		echo '$(NFS_EXPORT_DIR) *(rw,sync,no_subtree_check,no_root_squash)' | sudo tee -a /etc/exports
 	@sudo exportfs -rav
 	@echo "==> NFS export ready: $(NFS_EXPORT_DIR)"
 
@@ -72,12 +73,19 @@ cluster:
 	kubectl config set-cluster kind-kind --server=https://$$DOCKER_IP:6443
 
 nfs:
+	@echo "==> Detecting kind network configuration..."
+	@NFS_SERVER=$$(docker network inspect kind -f '{{range .IPAM.Config}}{{.Gateway}}{{end}}' 2>/dev/null | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | head -1); \
+	if [ -z "$$NFS_SERVER" ]; then \
+		echo "Error: kind cluster not found or network not configured"; \
+		exit 1; \
+	fi; \
+	echo "==> Using NFS server: $$NFS_SERVER"; \
 	helm repo add nfs-subdir-external-provisioner \
-	  https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner || true
-	helm repo update
+	  https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner || true; \
+	helm repo update; \
 	helm upgrade --install nfs-provisioner \
 	  nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
-	  --set nfs.server=$(NFS_SERVER) \
+	  --set nfs.server=$$NFS_SERVER \
 	  --set nfs.path=$(NFS_EXPORT_DIR) \
 	  --set storageClass.name=$(STORAGE_CLASS)
 
