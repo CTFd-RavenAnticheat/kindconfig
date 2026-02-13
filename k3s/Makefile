@@ -1,14 +1,15 @@
 # K3s Cluster Setup for Chall-Manager
 
-.PHONY: all server workers nfs metallb traefik storage status clean
+.PHONY: all server workers nfs metallb traefik storage app status clean
 
 # Configuration
 NFS_EXPORT_DIR := /srv/nfs/k8s
 STORAGE_CLASS := nfs-rwx
-SERVER_IP ?= $(shell ip route get 1 | awk '{print $$(NF-2); exit}')
+INTERNAL_IP := $(shell ip route get 1 | awk '{print $$(NF-2); exit}')
+POD_FILE := pod.yaml
 K3S_TOKEN ?= $(shell sudo cat /var/lib/rancher/k3s/server/node-token 2>/dev/null || echo "NOT_YET_CREATED")
 WORKER_IPS ?=
-
+PUBLIC_IP   := 4.233.136.48
 # OS Detection
 OS_ID := $(shell . /etc/os-release 2>/dev/null && echo $$ID)
 ifeq ($(OS_ID),ubuntu)
@@ -33,7 +34,7 @@ else
 	$(error Unsupported OS: $(OS_ID). Supported: ubuntu, debian, arch, centos, rhel, fedora)
 endif
 
-all: nfs server metallb storage
+all: nfs server  storage app
 
 # Setup NFS server on control plane
 nfs:
@@ -57,23 +58,28 @@ nfs:
 
 # Install k3s server (control plane + worker)
 server:
-	@echo "==> Installing k3s server on $(SERVER_IP)..."
-	@if ! command -v k3s >/dev/null 2>&1; then \
-		curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --disable=traefik --disable=servicelb --tls-san=$(SERVER_IP) --node-ip=$(SERVER_IP) --advertise-address=$(SERVER_IP)" sh -; \
-	else \
-		echo "k3s already installed"; \
-	fi
-	@echo "==> Waiting for k3s to be ready..."
-	@sleep 5
-	@until sudo kubectl get nodes 2>/dev/null | grep -q " Ready"; do sleep 2; done
-	@echo "==> k3s server ready!"
-	@echo "==> Node token for workers:"
-	@sudo cat /var/lib/rancher/k3s/server/node-token
+	@echo "==> Installing K3s (Internal: $(INTERNAL_IP) | Public: $(PUBLIC_IP))..."
+	# --node-ip uses internal for stability, --tls-san allows BOTH for the API cert
+	@curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server \
+		--node-ip=$(INTERNAL_IP) \
+		--advertise-address=$(INTERNAL_IP) \
+		--tls-san=$(INTERNAL_IP) \
+		--tls-san=$(PUBLIC_IP) \
+		--write-kubeconfig-mode=644" sh -
+	@echo "==> Waiting for K3s..."
+	@until sudo k3s kubectl get nodes | grep -q " Ready"; do sleep 2; done
+
+kubeconfig:
+	@mkdir -p ~/.kube
+	@sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+	@sudo chown $$(id -u):$$(id -g) ~/.kube/config
+	# Keep 127.0.0.1 for local VM commands to prevent Cloud I/O timeouts
+	@echo "==> Kubeconfig configured for local access via 127.0.0.1"
 
 # Show worker join command
 worker-join-cmd:
 	@echo "==> Run this on worker nodes:"
-	@echo "curl -sfL https://get.k3s.io | K3S_URL=https://$(SERVER_IP):6443 K3S_TOKEN=$$(sudo cat /var/lib/rancher/k3s/server/node-token) sh -"
+	@echo "curl -sfL https://get.k3s.io | K3S_URL=https://$(PUBLIC_IP):6443 K3S_TOKEN=$$(sudo cat /var/lib/rancher/k3s/server/node-token) sh -"
 
 # Join a worker node (run on worker VMs)
 join-worker:
@@ -96,66 +102,69 @@ kubeconfig:
 	@echo "==> kubeconfig ready at ~/.kube/config"
 
 # Install MetalLB
-metallb:
-	@echo "==> Installing MetalLB..."
-	@kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
-	@echo "==> Waiting for MetalLB controller..."
-	@kubectl wait --namespace metallb-system \
-		--for=condition=ready pod \
-		--selector=component=controller \
-		--timeout=120s 2>/dev/null || sleep 10
-	@echo "==> Waiting for MetalLB webhook..."
-	@sleep 5
-	@for i in $$(seq 1 20); do \
-		if kubectl get endpoints -n metallb-system webhook-service -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null | grep -q .; then \
-			echo "Webhook service ready!"; \
-			break; \
-		fi; \
-		echo "Waiting for webhook... ($$i/20)"; \
-		sleep 3; \
-	done
-	@echo "==> Configuring MetalLB IP pool..."
-	@sed "s/HOST_IP_PLACEHOLDER/$(SERVER_IP)/g" metallb-config.yaml | kubectl apply -f -
-	@echo "==> MetalLB configured with IP: $(SERVER_IP)"
+# metallb:
+# 	@echo "==> Installing MetalLB..."
+# 	@kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.5/config/manifests/metallb-native.yaml
+# 	@echo "==> Waiting for MetalLB controller..."
+# 	@kubectl wait --namespace metallb-system \
+# 		--for=condition=ready pod \
+# 		--selector=component=controller \
+# 		--timeout=120s 2>/dev/null || sleep 10
+# 	@echo "==> Waiting for MetalLB webhook..."
+# 	@sleep 5
+# 	@for i in $$(seq 1 20); do \
+# 		if kubectl get endpoints -n metallb-system webhook-service -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null | grep -q .; then \
+# 			echo "Webhook service ready!"; \
+# 			break; \
+# 		fi; \
+# 		echo "Waiting for webhook... ($$i/20)"; \
+# 		sleep 3; \
+# 	done
+# 	@echo "==> Configuring MetalLB IP pool..."
+# 	@sed "s/HOST_IP_PLACEHOLDER/$(SERVER_IP)/g" metallb-config.yaml | kubectl apply -f -
+# 	@echo "==> MetalLB configured with IP: $(SERVER_IP)"
 
 # Install Traefik with LoadBalancer
-traefik:
-	@echo "==> Installing Traefik..."
-	@helm repo add traefik https://traefik.github.io/charts 2>/dev/null || true
-	@helm repo update
-	@kubectl create namespace traefik --dry-run=client -o yaml | kubectl apply -f -
-	@helm upgrade --install traefik traefik/traefik \
-		--namespace traefik \
-		--set service.type=LoadBalancer \
-		--set ports.web.exposedPort=80 \
-		--set ports.websecure.exposedPort=443 \
-		--set ingressClass.enabled=true \
-		--set ingressClass.isDefaultClass=true
-	@echo "==> Waiting for Traefik..."
-	@kubectl wait --namespace traefik \
-		--for=condition=ready pod \
-		--selector=app.kubernetes.io/name=traefik \
-		--timeout=90s
-	@echo "==> Traefik ready!"
+# traefik:
+# 	@echo "==> Installing Traefik..."
+# 	@helm repo add traefik https://traefik.github.io/charts 2>/dev/null || true
+# 	@helm repo update
+# 	@kubectl create namespace traefik --dry-run=client -o yaml | kubectl apply -f -
+# 	@helm upgrade --install traefik traefik/traefik \
+# 		--namespace traefik \
+# 		--set service.type=LoadBalancer \
+# 		--set ports.web.exposedPort=80 \
+# 		--set ports.websecure.exposedPort=443 \
+# 		--set ingressClass.enabled=true \
+# 		--set ingressClass.isDefaultClass=true
+# 	@echo "==> Waiting for Traefik..."
+# 	@kubectl wait --namespace traefik \
+# 		--for=condition=ready pod \
+# 		--selector=app.kubernetes.io/name=traefik \
+# 		--timeout=90s
+# 	@echo "==> Traefik ready!"
 
 # Install NFS provisioner
 storage:
-	@echo "==> Installing NFS subdir external provisioner..."
-	@helm repo add nfs-subdir-external-provisioner \
-		https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner 2>/dev/null || true
+	@echo "==> Setting up NFS Provisioner pointing to $(INTERNAL_IP)..."
+	@helm repo add nfs-subdir-external-provisioner https://kubernetes-sigs.github.io/nfs-subdir-external-provisioner || true
 	@helm repo update
-	@helm upgrade --install nfs-provisioner \
-		nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
-		--set nfs.server=$(SERVER_IP) \
+	@helm upgrade --install nfs-provisioner nfs-subdir-external-provisioner/nfs-subdir-external-provisioner \
+		--set nfs.server=$(INTERNAL_IP) \
 		--set nfs.path=$(NFS_EXPORT_DIR) \
-		--set storageClass.name=$(STORAGE_CLASS) \
-		--set storageClass.allowVolumeExpansion=true
-	@echo "==> Waiting for StorageClass..."
-	@until kubectl get storageclass $(STORAGE_CLASS) >/dev/null 2>&1; do sleep 1; done
-	@echo "==> Creating PVC..."
+		--set storageClass.name=$(STORAGE_CLASS)
+	@echo "==> Waiting for Provisioner to be ready..."
+	@kubectl rollout status deployment/nfs-provisioner-nfs-subdir-external-provisioner --timeout=90s
+	@echo "==> Applying PVC..."
 	@kubectl apply -f pvc.yaml
-	@kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/pcap-core --timeout=120s
-	@echo "==> Storage ready!"
+
+# Deploy pcap-core-pod
+app:
+	@echo "==> Waiting for PVC to be bound..."
+	@kubectl wait --for=jsonpath='{.status.phase}'=Bound pvc/pcap-core --timeout=60s
+	@echo "==> Deploying pcap-core-pod..."
+	@kubectl apply -f $(POD_FILE)
+	@echo "==> pcap-core-pod deployed!"
 
 # Show status
 status:
@@ -169,6 +178,9 @@ status:
 	@echo "=== PVCs ==="
 	@kubectl get pvc
 	@echo ""
+	@echo "=== Pods ==="
+	@kubectl get pods
+	@echo ""
 	@echo "=== Services (Traefik/MetalLB) ==="
 	@kubectl get svc -n traefik 2>/dev/null || echo "Traefik not installed"
 	@kubectl get svc -n metallb-system 2>/dev/null | grep -v webhook || echo "MetalLB not installed"
@@ -177,6 +189,7 @@ status:
 clean:
 	@echo "==> Cleaning up k3s cluster..."
 	@kubectl delete deployment -l chall-manager.ctfer.io/challenge --all-namespaces 2>/dev/null || true
+	@kubectl delete -f $(POD_FILE) --ignore-not-found 2>/dev/null || true
 	@kubectl delete pvc pcap-core 2>/dev/null || true
 	@helm uninstall nfs-provisioner 2>/dev/null || true
 	@helm uninstall traefik -n traefik 2>/dev/null || true
@@ -194,11 +207,12 @@ help:
 	@echo "K3s Chall-Manager Setup"
 	@echo ""
 	@echo "Targets:"
-	@echo "  all          - Full setup: NFS, k3s server, MetalLB, storage"
+	@echo "  all          - Full setup: NFS, k3s server, MetalLB, storage, app"
 	@echo "  nfs          - Install and configure NFS server"
 	@echo "  server       - Install k3s control plane"
 	@echo "  metallb      - Install MetalLB for LoadBalancer services"
 	@echo "  storage      - Install NFS provisioner and create PVC"
+	@echo "  app          - Deploy pcap-core-pod"
 	@echo "  kubeconfig   - Copy kubeconfig for current user"
 	@echo "  worker-join-cmd - Show command to join worker nodes"
 	@echo "  status       - Show cluster status"
