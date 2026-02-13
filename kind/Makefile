@@ -39,7 +39,7 @@ $(error Unsupported OS ($(OS_ID)). Supported: arch, ubuntu, debian)
 endif
 .PHONY: all nfs status app cluster clean nfs-host storage traefik metallb
 
-all: cluster nfs metallb traefik storage app status
+all: nfs-host cluster nfs metallb traefik storage app status
 
 nfs-host:
 	@echo "==> Host OS detected: $(OS_ID)"
@@ -92,11 +92,17 @@ nfs:
 metallb:
 	@echo "==> Installing MetalLB..."
 	kubectl apply -f https://raw.githubusercontent.com/metallb/metallb/v0.14.3/config/manifests/metallb-native.yaml
-	@echo "==> Waiting for MetalLB to be ready..."
-	@sleep 5
-	kubectl wait --namespace metallb-system --for=condition=ready pod --selector=app=metallb --timeout=120s || \
-		(echo "Pods not ready yet, checking status..." && kubectl get pods -n metallb-system && \
-		 echo "Waiting again..." && kubectl wait --namespace metallb-system --for=condition=ready pod --selector=app=metallb --timeout=120s)
+	@echo "==> Waiting for MetalLB controller pod to be ready..."
+	kubectl wait --namespace metallb-system --for=condition=ready pod --selector=component=controller --timeout=120s
+	@echo "==> Waiting for MetalLB webhook service to be ready..."
+	@for i in 1 2 3 4 5 6 7 8 9 10; do \
+		if kubectl get endpoints -n metallb-system webhook-service -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null | grep -q .; then \
+			echo "Webhook service is ready!"; \
+			break; \
+		fi; \
+		echo "Waiting for webhook endpoints... (attempt $$i/10)"; \
+		sleep 3; \
+	done
 	@echo "==> Configuring MetalLB IP pool with IP: $(HOST_IP)..."
 	@sed "s/HOST_IP_PLACEHOLDER/$(HOST_IP)/g" metallb-config.yaml | kubectl apply -f -
 	@echo "==> MetalLB configured!"
